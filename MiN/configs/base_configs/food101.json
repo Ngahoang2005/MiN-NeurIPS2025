@@ -1,0 +1,9 @@
+{
+    "dataset": "ifood101",
+    "init_class": 11,
+    "increment": 10,
+    "img_size": 224,
+    "save_all_checkpoint": false,
+    "shuffle": true,
+    "seed": 1993
+}

@@ -1,0 +1,9 @@
+{
+    "dataset": "omnibenchmark",
+    "init_class": 30,
+    "increment": 30,
+    "img_size": 224,
+    "save_all_checkpoint": false,
+    "shuffle": true,
+    "seed": 1993
+}
