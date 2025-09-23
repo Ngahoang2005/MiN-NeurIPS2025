@@ -1,4 +1,11 @@
-# MIN: Mixture of Noise for Pre-Trained Model-Based Class-Incremental Learning --> [paper](https://arxiv.org/abs/2509.16738)
+# MIN: Mixture of Noise for Pre-Trained Model-Based Class-Incremental Learning
+
+<p align="center">
+  <a href='https://arxiv.org/abs/2509.16738'><img src='https://img.shields.io/badge/Arxiv-2509.16738-b31b1b.svg?logo=arXiv'></a>
+  <!-- <a href=""><img src="https://hits.seeyoufarm.com/api/count/incr/badge.svg?url=https%3A%2F%2Fgithub.com%2Fsun-hailong%2FLAMDA-PILOT&count_bg=%23FFA500&title_bg=%23555555&icon=&icon_color=%23E7E7E7&title=visitors&edge_flat=false"></a> -->
+  <a href=""><img src="https://black.readthedocs.io/en/stable/_static/license.svg"></a>
+</p>
+
 
 ![Overall](source/overall_00.png)
 
