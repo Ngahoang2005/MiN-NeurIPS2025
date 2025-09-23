@@ -1,4 +1,4 @@
-# MIN: Mixture of Noise for Pre-Trained Model-Based Class-Incremental Learning
+# MIN: Mixture of Noise for Pre-Trained Model-Based Class-Incremental Learning (NeurIPS 2025)
 
 <p align="center">
   <a href='https://arxiv.org/abs/2509.16738'><img src='https://img.shields.io/badge/Arxiv-2509.16738-b31b1b.svg?logo=arXiv'></a>
