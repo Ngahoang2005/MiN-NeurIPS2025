@@ -346,6 +346,7 @@ class MinNet(object):
         }
 
     def get_task_prototype_cfs(self, model, train_loader):
+        model.to(self.device)
         model.eval()
         device = self.device
         feature_dim = self._network.feature_dim
