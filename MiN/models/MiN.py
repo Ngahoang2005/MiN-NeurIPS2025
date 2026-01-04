@@ -4,10 +4,11 @@ import random
 import numpy as np
 from tqdm import tqdm
 import torch
-from torch import optim
+from torch import optim, nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 import copy
+import gc
 from utils.inc_net import MiNbaseNet
 from torch.utils.data import WeightedRandomSampler
 from utils.toolkit import tensor2numpy, count_parameters
@@ -119,11 +120,15 @@ class MinNet(object):
 
         self._network.update_fc(self.init_class)
         self._network.update_noise()
+       
         prototype = self.get_task_prototype_cfs(self._network, train_loader)
         self._network.extend_task_prototype(prototype)
         self.run(train_loader) # huấn luyện mạng lần đầu tiên
+        torch.cuda.empty_cache()
+        gc.collect()
         prototype = self.get_task_prototype_cfs(self._network, train_loader)
         self._network.update_task_prototype(prototype)
+        del train_loader, test_loader
         train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
                                   num_workers=self.num_workers)
         test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
@@ -145,6 +150,8 @@ class MinNet(object):
 
         del train_set
         del test_set
+        torch.cuda.empty_cache()
+        gc.collect()
 
     def increment_train(self, data_manger):
         self.cur_task += 1
@@ -178,6 +185,8 @@ class MinNet(object):
         prototype = self.get_task_prototype_cfs(self._network, train_loader)
         self._network.extend_task_prototype(prototype)
         self.run(train_loader) # huấn luyện noise
+        torch.cuda.empty_cache()
+        gc.collect()
         prototype = self.get_task_prototype_cfs(self._network, train_loader)
         self._network.update_task_prototype(prototype)
 
@@ -311,6 +320,8 @@ class MinNet(object):
             )
             self.logger.info(info)
             prog_bar.set_description(info)
+            del optimizer, scheduler
+            torch.cuda.empty_cache()
 
     def eval_task(self, test_loader):
         model = self._network.eval()
@@ -373,7 +384,8 @@ class MinNet(object):
             refined_features = cfs_module(all_features)
             prototype_mean = torch.mean(refined_features, dim=0)
             prototype_std = torch.std(refined_features, dim=0)
-            
+        del cfs_module, all_features, optimizer_cfs
+        torch.cuda.empty_cache()
         return (prototype_mean, prototype_std)
             
 class CFS_Module(nn.Module):
