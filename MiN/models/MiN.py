@@ -347,47 +347,86 @@ class MinNet(object):
 
     def get_task_prototype_cfs(self, model, train_loader):
         model.eval()
-        model.to(self.device)
-        
-        # Khởi tạo module CFS cho task hiện tại
+        device = self.device
         feature_dim = self._network.feature_dim
-        cfs_module = CFS_Module(feature_dim).to(self.device)
         
-        # 1. Thu thập tất cả đặc trưng của task hiện tại
+        # --- BƯỚC 0: Thu thập feature ---
         all_features = []
-        for i, (_, inputs, targets) in enumerate(train_loader):
-            inputs = inputs.to(self.device)
+        all_targets = []
+        for _, inputs, targets in train_loader:
+            inputs = inputs.to(device)
             with torch.no_grad():
-                feature = model.extract_feature(inputs) # Trích xuất từ backbone
-            all_features.append(feature)
+                feat = model.extract_feature(inputs)
+            all_features.append(feat.cpu())
+            all_targets.append(targets.cpu())
         
-        all_features = torch.cat(all_features, dim=0) # [N, Dim]
-
-        # 2. Huấn luyện CFS Module (Contrastive Selection)
-        # Mục tiêu: Làm nổi bật đặc trưng đặc thù của task này so với task cũ hoặc phân phối chung
-        optimizer_cfs = optim.Adam(cfs_module.parameters(), lr=0.001)
+        all_features = torch.cat(all_features, dim=0) # [N, dim]
+        all_targets = torch.cat(all_targets, dim=0)
+        unique_classes = torch.unique(all_targets)
         
-        for epoch in range(5): # Huấn luyện nhanh vài epoch
-            # Áp dụng chọn lọc đặc trưng
-            selected_features = cfs_module(all_features)
-            
-            # Tính toán Loss đối sánh đơn giản: Tối đa hóa phương sai giữa các chiều được chọn
-            # để đảm bảo các đặc trưng quan trọng được giữ lại
-            loss = -torch.var(selected_features) 
-            
-            optimizer_cfs.zero_grad()
-            loss.backward()
-            optimizer_cfs.step()
+        prototypes = {}
 
-        # 3. Tính Prototype đã qua tinh lọc
-        with torch.no_grad():
-            refined_features = cfs_module(all_features)
-            prototype_mean = torch.mean(refined_features, dim=0)
-            prototype_std = torch.std(refined_features, dim=0)
-        del cfs_module, all_features, optimizer_cfs
-        torch.cuda.empty_cache()
-        return (prototype_mean, prototype_std)
+        # --- CHẠY CFS CHO TỪNG CLASS ---
+        for cls in unique_classes:
+            cls_mask = (all_targets == cls)
+            cls_features = all_features[cls_mask].to(device) # Feature của 1 class
             
+            if cls_features.size(0) <= 1:
+                prototypes[cls.item()] = (torch.mean(cls_features, dim=0), torch.std(cls_features, dim=0))
+                continue
+
+            # PHẦN 1: Train f_cont (Negative Contrastive Learning)
+            f_cont = CFS_Mapping(feature_dim).to(device)
+            criterion = NegativeContrastiveLoss(tau=0.1)
+            optimizer = torch.optim.Adam(f_cont.parameters(), lr=1e-3)
+            
+            f_cont.train()
+            for _ in range(20): # Train ngắn để đạt tính uniformity
+                embeddings = f_cont(cls_features)
+                loss = criterion(embeddings)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+            
+            # PHẦN 2: Greedy Selection (Chọn feature đa dạng nhất)
+            f_cont.eval()
+            with torch.no_grad():
+                # Lấy embeddings đã được đẩy xa nhau
+                embeddings = F.normalize(f_cont(cls_features), dim=1)
+                
+                selected_indices = [0] # Bắt đầu từ feature đầu tiên
+                num_to_select = min(len(cls_features), 20) # Chọn top 20 đa dạng nhất
+                
+                for _ in range(num_to_select - 1):
+                    selected_feats = embeddings[selected_indices] # [M, dim]
+                    candidate_feats = embeddings # [N, dim]
+                    
+                    # Tính tương đồng giữa candidates và bộ đã chọn
+                    # [N, M]
+                    sim = torch.matmul(candidate_feats, selected_feats.t())
+                    # Lấy max similarity với bất kỳ cái nào đã chọn
+                    max_sim, _ = torch.max(sim, dim=1)
+                    # Chọn cái có độ tương đồng "lớn nhất" nhỏ nhất (Min-Max)
+                    max_sim[selected_indices] = 100.0 # Không chọn lại cái cũ
+                    best_candidate = torch.argmin(max_sim).item()
+                    selected_indices.append(best_candidate)
+            
+            # --- BƯỚC 3: Modeling từ tập đã chọn ---
+            final_selection = cls_features[selected_indices]
+            mean = torch.mean(final_selection, dim=0).cpu()
+            std = torch.std(final_selection, dim=0).cpu()
+            prototypes[cls.item()] = (mean, std)
+            
+            # Giải phóng bộ nhớ cho class tiếp theo
+            del f_cont, cls_features, embeddings
+            torch.cuda.empty_cache()
+
+        # MiN cần 1 prototype chung cho cả Task (theo code cũ của bạn)
+        # Chúng ta lấy trung bình của các class prototype
+        all_means = torch.stack([p[0] for p in prototypes.values()])
+        all_stds = torch.stack([p[1] for p in prototypes.values()])
+        
+        return (torch.mean(all_means, dim=0), torch.mean(all_stds, dim=0))        
 class CFS_Module(nn.Module):
     def __init__(self, feature_dim):
         super(CFS_Module, self).__init__()
@@ -402,3 +441,36 @@ class CFS_Module(nn.Module):
     def forward(self, x):
         weights = self.selector(x)
         return x * weights # Lọc đặc trưng bằng cách nhân với trọng số
+class NegativeContrastiveLoss(torch.nn.Module):
+    def __init__(self, tau=0.1):
+        super().__init__()
+        self.tau = tau
+
+    def forward(self, x): # x.shape = [N, dim]
+        # Chuẩn hóa về unit sphere
+        x = F.normalize(x, dim=1)
+        x_1 = torch.unsqueeze(x, dim=0) # [1, N, dim]
+        x_2 = torch.unsqueeze(x, dim=1) # [N, 1, dim]
+        
+        # Tính Cosine Similarity
+        cos = torch.sum(x_1 * x_2, dim=2) / self.tau # [N, N]
+        exp_cos = torch.exp(cos)
+        
+        # Loại bỏ các phần tử đường chéo (similarity với chính nó)
+        mask = torch.eye(x.size(0), device=x.device).bool()
+        exp_cos = exp_cos.masked_fill(mask, 0)
+        
+        loss = torch.log(exp_cos.sum(dim=1) / (x.size(0) - 1) + EPSILON)
+        return torch.mean(loss)
+class CFS_Mapping(torch.nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.f_cont = torch.nn.Sequential(
+            torch.nn.Linear(dim, dim),
+            torch.nn.BatchNorm1d(dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(dim, dim)
+        )
+
+    def forward(self, x):
+        return self.f_cont(x)
