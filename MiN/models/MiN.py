@@ -320,8 +320,8 @@ class MinNet(object):
             )
             self.logger.info(info)
             prog_bar.set_description(info)
-            del optimizer, scheduler
-            torch.cuda.empty_cache()
+        del optimizer, scheduler
+        torch.cuda.empty_cache()
 
     def eval_task(self, test_loader):
         model = self._network.eval()
