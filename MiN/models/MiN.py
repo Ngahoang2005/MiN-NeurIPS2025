@@ -119,10 +119,10 @@ class MinNet(object):
 
         self._network.update_fc(self.init_class)
         self._network.update_noise()
-        prototype = self.get_task_prototype(self._network, train_loader)
+        prototype = self.get_task_prototype_cfs(self._network, train_loader)
         self._network.extend_task_prototype(prototype)
-        self.run(train_loader)
-        prototype = self.get_task_prototype(self._network, train_loader)
+        self.run(train_loader) # huấn luyện mạng lần đầu tiên
+        prototype = self.get_task_prototype_cfs(self._network, train_loader)
         self._network.update_task_prototype(prototype)
         train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
                                   num_workers=self.num_workers)
@@ -164,21 +164,21 @@ class MinNet(object):
 
         self.test_loader = test_loader
 
-        if self.args['pretrained']:
+        if self.args['pretrained']: # đóng băng toàn bộ backbone
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
-
+        # cập nhật classifier để mở rộng số lớp
         self.fit_fc(train_loader, test_loader)
 
         self._network.update_fc(self.increment)
 
         train_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
                                     num_workers=self.num_workers)
-        self._network.update_noise()
-        prototype = self.get_task_prototype(self._network, train_loader)
+        self._network.update_noise() # khởi tạo noise cho các lớp mới
+        prototype = self.get_task_prototype_cfs(self._network, train_loader)
         self._network.extend_task_prototype(prototype)
-        self.run(train_loader)
-        prototype = self.get_task_prototype(self._network, train_loader)
+        self.run(train_loader) # huấn luyện noise
+        prototype = self.get_task_prototype_cfs(self._network, train_loader)
         self._network.update_task_prototype(prototype)
 
         del train_set
@@ -200,7 +200,7 @@ class MinNet(object):
         del train_set
         del test_set
 
-    def fit_fc(self, train_loader, test_loader):
+    def fit_fc(self, train_loader, test_loader): # fit classifier after training backbone
         self._network.eval()
         self._network.to(self.device)
 
@@ -218,7 +218,7 @@ class MinNet(object):
             self.logger.info(info)
             prog_bar.set_description(info)
 
-    def re_fit(self, train_loader, test_loader):
+    def re_fit(self, train_loader, test_loader): # re-fit classifier after training backbone
         self._network.eval()
         self._network.to(self.device)
         prog_bar = tqdm(train_loader)
@@ -235,6 +235,13 @@ class MinNet(object):
             prog_bar.set_description(info)
 
     def run(self, train_loader):
+        # luồng huấn luyện như sau: 
+        # 1. freeze toàn bộ mạng
+        # 2. unfreeze classifier
+        # 3. nếu là task đầu tiên thì unfreeze toàn bộ backbone để fine-tune, weight được fine tune bao gồm backbone và classifier, loss là cross-entropy, cập nhật bằng optimizer: Adam hoặc SGD
+        # 4. nếu không thì unfreeze mỗi noise parameters
+        # 5. huấn luyện weight là classifier và noise parameters với loss là cross-entropy, cập nhật bằng optimizer: Adam hoặc SGD
+        # 6. lặp lại từ bước 1 đến hết epochs
         if self.cur_task == 0:
             epochs = self.init_epochs
             lr = self.init_lr
@@ -244,14 +251,14 @@ class MinNet(object):
             lr = self.lr
             weight_decay = self.weight_decay
 
-        for param in self._network.parameters():
+        for param in self._network.parameters(): # freeze all the parameters
             param.requires_grad = False
-        for param in self._network.normal_fc.parameters():
+        for param in self._network.normal_fc.parameters(): # unfreeze the classifier parameters
             param.requires_grad = True
             
-        if self.cur_task == 0:
+        if self.cur_task == 0: # nếu là task đầu tiên thì unfreeze all the backbone parameters để fine-tune
             self._network.init_unfreeze()
-        else:
+        else: # nếu không thì unfreeze mỗi noise parameters
             self._network.unfreeze_noise()
             
         params = filter(lambda p: p.requires_grad, self._network.parameters())
@@ -270,10 +277,10 @@ class MinNet(object):
                 if self.cur_task > 0:
                     with torch.no_grad():
                         outputs1 = self._network(inputs, new_forward=False)
-                        logits1 = outputs1['logits']
+                        logits1 = outputs1['logits'] # logit của mạng hiện tại
                     outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
-                    logits2 = outputs2['logits']
-                    logits2 = logits2 + logits1
+                    logits2 = outputs2['logits'] # logit của mạng bình thường không có noise
+                    logits2 = logits2 + logits1 # cộng logit để huấn luyện
                     loss = F.cross_entropy(logits2, targets.long())
                 else:
                     outputs = self._network.forward_normal_fc(inputs, new_forward=False)
@@ -327,15 +334,59 @@ class MinNet(object):
             "all_task_accy": task_info['task_accy'],
         }
 
-    def get_task_prototype(self, model, train_loader):
-        model = model.eval()
+    def get_task_prototype_cfs(self, model, train_loader):
+        model.eval()
         model.to(self.device)
-        features = []
+        
+        # Khởi tạo module CFS cho task hiện tại
+        feature_dim = self._network.feature_dim
+        cfs_module = CFS_Module(feature_dim).to(self.device)
+        
+        # 1. Thu thập tất cả đặc trưng của task hiện tại
+        all_features = []
         for i, (_, inputs, targets) in enumerate(train_loader):
-            inputs, targets = inputs.to(self.device), targets.to(self.device)
+            inputs = inputs.to(self.device)
             with torch.no_grad():
-                feature = model.extract_feature(inputs)
-            features.append(feature)
-        prototype = torch.mean(torch.concat(features, dim=0), dim=0)
-        return prototype
+                feature = model.extract_feature(inputs) # Trích xuất từ backbone
+            all_features.append(feature)
+        
+        all_features = torch.cat(all_features, dim=0) # [N, Dim]
+
+        # 2. Huấn luyện CFS Module (Contrastive Selection)
+        # Mục tiêu: Làm nổi bật đặc trưng đặc thù của task này so với task cũ hoặc phân phối chung
+        optimizer_cfs = optim.Adam(cfs_module.parameters(), lr=0.001)
+        
+        for epoch in range(5): # Huấn luyện nhanh vài epoch
+            # Áp dụng chọn lọc đặc trưng
+            selected_features = cfs_module(all_features)
             
+            # Tính toán Loss đối sánh đơn giản: Tối đa hóa phương sai giữa các chiều được chọn
+            # để đảm bảo các đặc trưng quan trọng được giữ lại
+            loss = -torch.var(selected_features) 
+            
+            optimizer_cfs.zero_grad()
+            loss.backward()
+            optimizer_cfs.step()
+
+        # 3. Tính Prototype đã qua tinh lọc
+        with torch.no_grad():
+            refined_features = cfs_module(all_features)
+            prototype_mean = torch.mean(refined_features, dim=0)
+            prototype_std = torch.std(refined_features, dim=0)
+            
+        return (prototype_mean, prototype_std)
+            
+class CFS_Module(nn.Module):
+    def __init__(self, feature_dim):
+        super(CFS_Module, self).__init__()
+        # CFS sử dụng một MLP nhẹ để tính toán trọng số quan trọng cho từng chiều đặc trưng
+        self.selector = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim // 4),
+            nn.GELU(),
+            nn.Linear(feature_dim // 4, feature_dim),
+            nn.Sigmoid() # Trọng số trong khoảng [0, 1]
+        )
+
+    def forward(self, x):
+        weights = self.selector(x)
+        return x * weights # Lọc đặc trưng bằng cách nhân với trọng số

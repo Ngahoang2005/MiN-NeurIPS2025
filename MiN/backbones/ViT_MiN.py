@@ -142,7 +142,7 @@ class PiNoise(torch.nn.Linear):
         noise = None
 
         for i in range(len(self.mu)):
-            mu = self.mu[i](x_down)
+            mu = self.mu[i](x_down) 
             sigmma = self.sigmma[i](x_down)
             if noise is None:
                 noise = (mu + sigmma) * self.weight_noise[i]
