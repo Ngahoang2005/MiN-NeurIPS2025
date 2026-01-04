@@ -344,8 +344,8 @@ class MinNet(object):
             "task_confusion": task_info['task_confusion_matrices'],
             "all_task_accy": task_info['task_accy'],
         }
-
-    def get_task_prototype_cfs(self, model, train_loader):
+    # bản chưa khởi tạo index xịn
+    # def get_task_prototype_cfs(self, model, train_loader):
         model.to(self.device)
         model.eval()
         device = self.device
@@ -428,6 +428,97 @@ class MinNet(object):
         all_stds = torch.stack([p[1] for p in prototypes.values()])
         
         return (torch.mean(all_means, dim=0), torch.mean(all_stds, dim=0))        
+    # bản khởi tạo index xịn
+    def get_task_prototype_cfs(self, model, train_loader):
+        model.to(self.device)
+        model.eval()
+        device = self.device
+        feature_dim = self._network.feature_dim
+        
+        # --- BƯỚC 0: Thu thập feature thật ---
+        all_real_features = []
+        all_real_targets = []
+        for _, inputs, targets in train_loader:
+            inputs = inputs.to(device)
+            with torch.no_grad():
+                feat = model.extract_feature(inputs)
+            all_real_features.append(feat.cpu())
+            all_real_targets.append(targets.cpu())
+        
+        all_real_features = torch.cat(all_real_features, dim=0)
+        all_real_targets = torch.cat(all_real_targets, dim=0)
+        unique_classes = torch.unique(all_real_targets)
+        
+        prototypes = {}
+
+        for cls in unique_classes:
+            cls_mask = (all_real_targets == cls)
+            cls_real = all_real_features[cls_mask].to(device)
+            
+            # 1. MODELING: Tính thông số phân phối của class
+            cls_mean = torch.mean(cls_real, dim=0)
+            cls_std = torch.std(cls_real, dim=0) + EPSILON
+
+            # 2. TRAIN CONTRASTIVE MODEL (f_cont)
+            # Học cách ánh xạ feature sao cho chúng trải đều trên hypersphere
+            f_cont = CFS_Mapping(feature_dim).to(device)
+            optimizer = torch.optim.Adam(f_cont.parameters(), lr=1e-3)
+            criterion = NegativeContrastiveLoss(tau=0.1)
+            
+            f_cont.train()
+            for _ in range(20):
+                embeddings = f_cont(cls_real)
+                loss = criterion(embeddings)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+            
+            # 3. GREEDY SELECTION TỪ GAUSSIAN SAMPLE
+            f_cont.eval()
+            all_selected_feats = None
+            samples_needed = 20 # Số lượng feature đa dạng cần chọn
+            sup_batch = 100     # Mỗi bước Greedy, sample 100 ứng viên để chọn
+            
+            with torch.no_grad():
+                for step in range(samples_needed):
+                    # Sample candidates từ phân phối Gaussian của class
+                    eps = torch.randn([sup_batch, feature_dim], device=device)
+                    candidate_feats = eps * cls_std + cls_mean
+                    
+                    if all_selected_feats is None:
+                        # Lần đầu tiên: Chỉ lấy một batch ngẫu nhiên như flow bạn mô tả
+                        all_selected_feats = candidate_feats[:5] # Lấy 5 mẫu khởi tạo
+                    else:
+                        # Tính Average Cosine Similarity với tập đã chọn
+                        # embedding của candidates và tập đã chọn
+                        cont_cand = F.normalize(f_cont(candidate_feats), dim=1)
+                        cont_selected = F.normalize(f_cont(all_selected_feats), dim=1)
+                        
+                        # [sup_batch, num_selected]
+                        sim_matrix = torch.matmul(cont_cand, cont_selected.t())
+                        
+                        # Tính Average Similarity (xem xét density)
+                        avg_sim = torch.mean(sim_matrix, dim=1)
+                        
+                        # CHỌN những candidate có average similarity THẤP NHẤT (đa dạng nhất)
+                        slt_ids = torch.argsort(avg_sim)[:1] # Chọn 1 cái tốt nhất mỗi bước
+                        all_selected_feats = torch.cat([all_selected_feats, candidate_feats[slt_ids]], dim=0)
+                    
+                    if all_selected_feats.shape[0] >= samples_needed:
+                        break
+
+            # 4. FINAL PROTOTYPE: Tính từ tập đã được tinh lọc qua Greedy
+            final_mean = torch.mean(all_selected_feats, dim=0).cpu()
+            final_std = torch.std(all_selected_feats, dim=0).cpu()
+            prototypes[cls.item()] = (final_mean, final_std)
+            
+            del f_cont, cls_real, all_selected_feats
+            torch.cuda.empty_cache()
+
+        # MiN aggregation
+        all_means = torch.stack([p[0] for p in prototypes.values()])
+        all_stds = torch.stack([p[1] for p in prototypes.values()])
+        return (torch.mean(all_means, dim=0), torch.mean(all_stds, dim=0))
 class CFS_Module(nn.Module):
     def __init__(self, feature_dim):
         super(CFS_Module, self).__init__()
@@ -453,7 +544,7 @@ class NegativeContrastiveLoss(torch.nn.Module):
         x_1 = torch.unsqueeze(x, dim=0) # [1, N, dim]
         x_2 = torch.unsqueeze(x, dim=1) # [N, 1, dim]
         
-        # Tính Cosine Similarity
+        # Tính Cosine Simailarity
         cos = torch.sum(x_1 * x_2, dim=2) / self.tau # [N, N]
         exp_cos = torch.exp(cos)
         
