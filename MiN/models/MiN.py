@@ -117,18 +117,28 @@ class MinNet(object):
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = True
+        
+        self._clear_gpu()
 
         self._network.update_fc(self.init_class)
         self._network.update_noise()
-       
+       # Tính prototype lần 1: lấy prototype từ dữ liệu thực
         prototype = self.get_task_prototype_cfs(self._network, train_loader)
         self._network.extend_task_prototype(prototype)
+        self._clear_gpu()
+
         self.run(train_loader) # huấn luyện mạng lần đầu tiên
+        self._clear_gpu()
         torch.cuda.empty_cache()
         gc.collect()
+        # cập nhật prototype lần 2: lấy prototype từ dữ liệu thực sau khi huấn luyện
         prototype = self.get_task_prototype_cfs(self._network, train_loader)
         self._network.update_task_prototype(prototype)
+        self._clear_gpu()
+
         del train_loader, test_loader
+        self._clear_gpu()
+
         train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
                                   num_workers=self.num_workers)
         test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
@@ -177,6 +187,9 @@ class MinNet(object):
         # cập nhật classifier để mở rộng số lớp
         self.fit_fc(train_loader, test_loader)
 
+        del train_loader, test_loader
+        self._clear_gpu()
+
         self._network.update_fc(self.increment)
 
         train_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
@@ -184,6 +197,8 @@ class MinNet(object):
         self._network.update_noise() # khởi tạo noise cho các lớp mới
         prototype = self.get_task_prototype_cfs(self._network, train_loader)
         self._network.extend_task_prototype(prototype)
+        self._clear_gpu()
+
         self.run(train_loader) # huấn luyện noise
         torch.cuda.empty_cache()
         gc.collect()
@@ -208,6 +223,7 @@ class MinNet(object):
 
         del train_set
         del test_set
+        self._clear_gpu()
 
     def fit_fc(self, train_loader, test_loader): # fit classifier after training backbone
         self._network.eval()
@@ -322,6 +338,7 @@ class MinNet(object):
             prog_bar.set_description(info)
         del optimizer, scheduler
         torch.cuda.empty_cache()
+        self._clear_gpu()
 
     def eval_task(self, test_loader):
         model = self._network.eval()
@@ -514,11 +531,20 @@ class MinNet(object):
             
             del f_cont, cls_real, all_selected_feats
             torch.cuda.empty_cache()
+            self._clear_gpu()
 
         # MiN aggregation
         all_means = torch.stack([p[0] for p in prototypes.values()])
         all_stds = torch.stack([p[1] for p in prototypes.values()])
+        del all_real_features, all_real_targets, prototypes
+        self._clear_gpu()
         return (torch.mean(all_means, dim=0), torch.mean(all_stds, dim=0))
+    def _clear_gpu(self):
+        """Hàm dọn dẹp tổng lực"""
+        gc.collect()
+        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize() # Đợi GPU hoàn thành mọi lệnh trước khi dọn
 class CFS_Module(nn.Module):
     def __init__(self, feature_dim):
         super(CFS_Module, self).__init__()
@@ -566,3 +592,4 @@ class CFS_Mapping(torch.nn.Module):
 
     def forward(self, x):
         return self.f_cont(x)
+    
