@@ -115,13 +115,20 @@ class PiNoise(torch.nn.Linear):
         else:
             self.weight_noise = torch.zeros(len(self.mu), requires_grad=True)
             weight = torch.ones(len(self.mu))
+            mu_t = prototypes[-1]
+            if isinstance(mu_t, tuple) or isinstance(mu_t, list):
+                mu_t = mu_t[0] # Chỉ lấy Mean Vector để tính góc (similarity)
             for i in range(len(prototypes)):
-                mu_t = prototypes[-1]
                 mu_i = prototypes[i]
+                if isinstance(mu_i, tuple) or isinstance(mu_i, list):
+                    mu_i = mu_i[0] # Chỉ lấy Mean Vector
+                
+                # Tính Cosine Similarity dựa trên Mean Vector
                 dot_product = torch.dot(mu_t, mu_i)
                 norm_t = torch.norm(mu_t)
                 norm_i = torch.norm(mu_i)
-                s_i = dot_product / (norm_t * norm_i)
+                s_i = dot_product / (norm_t * norm_i + 1e-8) # Thêm epsilon tránh chia 0
+                
                 weight[i] = s_i.detach().clone()
             weight = torch.softmax(weight, dim=-1)
             self.weight_noise = weight
@@ -142,13 +149,15 @@ class PiNoise(torch.nn.Linear):
         noise = None
 
         for i in range(len(self.mu)):
-            mu = self.mu[i](x_down) 
+            mu = self.mu[i](x_down)
             sigmma = self.sigmma[i](x_down)
+            w_val = 1.0 
+            if self.weight_noise is not None and i < len(self.weight_noise):
+                w_val = self.weight_noise[i]
             if noise is None:
-                noise = (mu + sigmma) * self.weight_noise[i]
+                noise = (mu + sigmma) * w_val
             else:
-                noise += (mu + sigmma) * self.weight_noise[i]
-
+                noise += (mu + sigmma) * w_val
         noise = noise @ self.w_up
 
         return x1 + noise + hyper_features
@@ -160,8 +169,10 @@ class PiNoise(torch.nn.Linear):
 
         mu = self.mu[-1](x_down)
         sigmma = self.sigmma[-1](x_down)
-
-        noise = (mu + sigmma) * self.weight_noise[-1]
+        w_val = 1.0
+        if self.weight_noise is not None:
+            w_val = self.weight_noise[-1]
+        noise = (mu + sigmma) * w_val
 
         noise = noise @ self.w_up
 
