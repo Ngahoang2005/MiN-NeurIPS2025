@@ -455,20 +455,23 @@ class MinNet(object):
         return (torch.mean(all_means, dim=0), torch.mean(all_stds, dim=0))        
     # bản khởi tạo index xịn
     def get_task_prototype_cfs(self, model, train_loader):
-        model.to(self.device)
         model.eval()
         device = self.device
         feature_dim = self._network.feature_dim
         
-        # --- BƯỚC 0: Thu thập feature thật ---
         all_real_features = []
         all_real_targets = []
-        for _, inputs, targets in train_loader:
-            inputs = inputs.to(device)
-            with torch.no_grad():
-                feat = model.extract_feature(inputs)
-            all_real_features.append(feat.cpu())
-            all_real_targets.append(targets.cpu())
+        
+        # 1. Thu thập feature an toàn
+        with torch.no_grad():
+            for _, inputs, targets in train_loader:
+                inputs = inputs.to(device)
+                # Dùng autocast ngay cả khi trích xuất feature để tiết kiệm RAM
+                with torch.cuda.amp.autocast():
+                    feat = model.extract_feature(inputs)
+                all_real_features.append(feat.detach().cpu())
+                all_real_targets.append(targets.cpu())
+                del inputs, feat
         
         all_real_features = torch.cat(all_real_features, dim=0)
         all_real_targets = torch.cat(all_real_targets, dim=0)
@@ -478,74 +481,66 @@ class MinNet(object):
 
         for cls in unique_classes:
             cls_mask = (all_real_targets == cls)
-            cls_real = all_real_features[cls_mask].to(device)
+            cls_real = all_real_features[cls_mask]
             
-            # 1. MODELING: Tính thông số phân phối của class
+            # GIỚI HẠN MẪU: Nếu class quá đông, chỉ lấy 300 mẫu ngẫu nhiên
+            if cls_real.size(0) > 300:
+                indices = torch.randperm(cls_real.size(0))[:300]
+                cls_real = cls_real[indices]
+            
+            cls_real = cls_real.to(device)
             cls_mean = torch.mean(cls_real, dim=0)
             cls_std = torch.std(cls_real, dim=0) + EPSILON
 
-            # 2. TRAIN CONTRASTIVE MODEL (f_cont)
-            # Học cách ánh xạ feature sao cho chúng trải đều trên hypersphere
+            # 2. Train f_cont ngắn hạn
             f_cont = CFS_Mapping(feature_dim).to(device)
             optimizer = torch.optim.Adam(f_cont.parameters(), lr=1e-3)
             criterion = NegativeContrastiveLoss(tau=0.1)
             
             f_cont.train()
-            for _ in range(20):
-                embeddings = f_cont(cls_real)
-                loss = criterion(embeddings)
+            for _ in range(15): # Giảm xuống 15 epoch để nhanh hơn
+                with torch.cuda.amp.autocast():
+                    embeddings = f_cont(cls_real)
+                    loss = criterion(embeddings)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
             
-            # 3. GREEDY SELECTION TỪ GAUSSIAN SAMPLE
+            # 3. Greedy Selection
             f_cont.eval()
             all_selected_feats = None
-            samples_needed = 20 # Số lượng feature đa dạng cần chọn
-            sup_batch = 100     # Mỗi bước Greedy, sample 100 ứng viên để chọn
+            samples_needed = 20
+            sup_batch = 50 # Giảm batch ứng viên xuống 50 để tránh sim_matrix quá lớn
             
             with torch.no_grad():
                 for step in range(samples_needed):
-                    # Sample candidates từ phân phối Gaussian của class
                     eps = torch.randn([sup_batch, feature_dim], device=device)
                     candidate_feats = eps * cls_std + cls_mean
                     
                     if all_selected_feats is None:
-                        # Lần đầu tiên: Chỉ lấy một batch ngẫu nhiên như flow bạn mô tả
-                        all_selected_feats = candidate_feats[:5] # Lấy 5 mẫu khởi tạo
+                        all_selected_feats = candidate_feats[:5]
                     else:
-                        # Tính Average Cosine Similarity với tập đã chọn
-                        # embedding của candidates và tập đã chọn
-                        cont_cand = F.normalize(f_cont(candidate_feats), dim=1)
-                        cont_selected = F.normalize(f_cont(all_selected_feats), dim=1)
+                        with torch.cuda.amp.autocast():
+                            cont_cand = F.normalize(f_cont(candidate_feats), dim=1)
+                            cont_selected = F.normalize(f_cont(all_selected_feats), dim=1)
+                            sim_matrix = torch.matmul(cont_cand, cont_selected.t())
+                            avg_sim = torch.mean(sim_matrix, dim=1)
                         
-                        # [sup_batch, num_selected]
-                        sim_matrix = torch.matmul(cont_cand, cont_selected.t())
-                        
-                        # Tính Average Similarity (xem xét density)
-                        avg_sim = torch.mean(sim_matrix, dim=1)
-                        
-                        # CHỌN những candidate có average similarity THẤP NHẤT (đa dạng nhất)
-                        slt_ids = torch.argsort(avg_sim)[:1] # Chọn 1 cái tốt nhất mỗi bước
+                        slt_ids = torch.argsort(avg_sim)[:1]
                         all_selected_feats = torch.cat([all_selected_feats, candidate_feats[slt_ids]], dim=0)
-                    
-                    if all_selected_feats.shape[0] >= samples_needed:
-                        break
+                    del eps, candidate_feats
 
-            # 4. FINAL PROTOTYPE: Tính từ tập đã được tinh lọc qua Greedy
-            final_mean = torch.mean(all_selected_feats, dim=0).cpu()
-            final_std = torch.std(all_selected_feats, dim=0).cpu()
-            prototypes[cls.item()] = (final_mean, final_std)
+            prototypes[cls.item()] = (torch.mean(all_selected_feats, dim=0).cpu(), 
+                                      torch.std(all_selected_feats, dim=0).cpu())
             
-            del f_cont, cls_real, all_selected_feats
-            torch.cuda.empty_cache()
+            # DỌN DẸP TRIỆT ĐỂ sau mỗi class
+            del f_cont, optimizer, criterion, cls_real, all_selected_feats
             self._clear_gpu()
 
-        # MiN aggregation
         all_means = torch.stack([p[0] for p in prototypes.values()])
         all_stds = torch.stack([p[1] for p in prototypes.values()])
-        del all_real_features, all_real_targets, prototypes
-        self._clear_gpu()
+        
+        del all_real_features, all_real_targets
         return (torch.mean(all_means, dim=0), torch.mean(all_stds, dim=0))
     def _clear_gpu(self):
         """Hàm dọn dẹp tổng lực"""
