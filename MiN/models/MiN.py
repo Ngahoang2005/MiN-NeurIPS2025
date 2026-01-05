@@ -455,6 +455,7 @@ class MinNet(object):
         return (torch.mean(all_means, dim=0), torch.mean(all_stds, dim=0))        
     # bản khởi tạo index xịn
     def get_task_prototype_cfs(self, model, train_loader):
+        model.to(self.device)
         model.eval()
         device = self.device
         feature_dim = self._network.feature_dim
@@ -467,8 +468,8 @@ class MinNet(object):
             for _, inputs, targets in train_loader:
                 inputs = inputs.to(device)
                 # Dùng autocast ngay cả khi trích xuất feature để tiết kiệm RAM
-                with torch.cuda.amp.autocast():
-                    feat = model.extract_feature(inputs)
+                
+                feat = model.extract_feature(inputs)
                 all_real_features.append(feat.detach().cpu())
                 all_real_targets.append(targets.cpu())
                 del inputs, feat
