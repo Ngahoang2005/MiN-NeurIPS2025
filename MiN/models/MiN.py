@@ -461,14 +461,13 @@ class MinNet(object):
         
         all_real_features = []
         all_real_targets = []
+        model.to(device).float()
         
         # 1. Thu thập feature an toàn (Giải quyết Peak 5.64GB ban đầu)
         with torch.no_grad():
             for _, inputs, targets in train_loader:
                 inputs = inputs.to(device).float() # Đảm bảo float32 để khớp weight backbone
-                # Sử dụng cú pháp autocast mới để tiết kiệm RAM khi extract
-                with torch.amp.autocast('cuda'):
-                    feat = model.extract_feature(inputs)
+                feat = model.extract_feature(inputs)
                 
                 # .detach().cpu() là bắt buộc để giải phóng RAM GPU ngay lập tức
                 all_real_features.append(feat.detach().cpu())
