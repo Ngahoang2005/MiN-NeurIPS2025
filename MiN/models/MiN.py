@@ -322,8 +322,12 @@ class MinNet(object):
     #  PHẦN CFS PROTOTYPE CẢI TIẾN & TỐI ƯU OOM
     # =========================================================================
     def get_task_prototype_cfs(self, model, train_loader):
+        device = self.device  # Lấy device từ class
+        
+        # --- FIX LỖI QUAN TRỌNG: Đẩy Model lên GPU và ép kiểu Float32 ---
+        model.to(device)      # Bắt buộc: Đưa trọng số model lên GPU
+        model.float()         # Bắt buộc: Ép về float32 để tránh lỗi mismatch với input
         model.eval()
-        device = self.device
         feature_dim = self._network.feature_dim
         
         all_real_features = []
