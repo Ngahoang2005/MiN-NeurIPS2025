@@ -16,7 +16,8 @@ import os
 from data_process.data_manger import DataManger
 from utils.training_tool import get_optimizer, get_scheduler
 from utils.toolkit import calculate_class_metrics, calculate_task_metrics
-
+from torch.cuda.amp import autocast, GradScaler
+from torch.utils.checkpoint import checkpoint
 EPSILON = 1e-8
 
 
@@ -289,41 +290,48 @@ class MinNet(object):
         params = filter(lambda p: p.requires_grad, self._network.parameters())
         optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
-
+        if hasattr(self._network.backbone, 'set_grad_checkpointing'):
+            self._network.backbone.set_grad_checkpointing(True)
+            self.logger.info("Gradient Checkpointing activated for backbone.")
+        scaler = GradScaler()
         prog_bar = tqdm(range(epochs))
+        
         self._network.train()
         self._network.to(self.device)
+
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
             correct, total = 0, 0
 
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
-                if self.cur_task > 0:
-                    with torch.no_grad():
-                        outputs1 = self._network(inputs, new_forward=False)
-                        logits1 = outputs1['logits'] # logit của mạng hiện tại
-                    outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
-                    logits2 = outputs2['logits'] # logit của mạng bình thường không có noise
-                    logits2 = logits2 + logits1 # cộng logit để huấn luyện
-                    loss = F.cross_entropy(logits2, targets.long())
-                else:
-                    outputs = self._network.forward_normal_fc(inputs, new_forward=False)
-                    logits = outputs["logits"]
-                    loss = F.cross_entropy(logits, targets.long())
-
                 optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                losses += loss.item()
+                with autocast():
+                    if self.cur_task > 0:
+                    # Với MiN, ta có logits từ mạng có noise và mạng bình thường
+                        outputs1 = self._network(inputs, new_forward=False)
+                        logits1 = outputs1['logits']
+                        
+                        outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
+                        logits2 = outputs2['logits']
+                        
+                        logits_final = logits2 + logits1
+                        loss = F.cross_entropy(logits_final, targets.long())
+                    else:
+                        outputs = self._network.forward_normal_fc(inputs, new_forward=False)
+                        logits_final = outputs["logits"]
+                        loss = F.cross_entropy(logits_final, targets.long())
+                        
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
-                if self.cur_task > 0:
-                    _, preds = torch.max(logits2, dim=1)
-                else:
-                    _, preds = torch.max(logits, dim=1)
+                losses += loss.item()
+                _, preds = torch.max(logits_final, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
-
+                del inputs, targets, logits_final, loss
+        
             scheduler.step()
             train_acc = 100. * correct / total
 
