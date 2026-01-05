@@ -150,6 +150,20 @@ class MinNet(object):
 
         del train_set, test_set, train_loader, test_loader
         self._clear_gpu()
+        # --- THÊM ĐOẠN NÀY ĐỂ IN TEST ACC NGAY LẬP TỨC ---
+        self.logger.info(f"End of Task {self.cur_task}. Calculating Test Accuracy...")
+        _, test_list, _ = data_manger.get_task_list(self.cur_task)
+        test_set = data_manger.get_task_data(source="test", class_list=test_list)
+        test_set.labels = self.cat2order(test_set.labels, data_manger)
+        # Dùng batch_size lớn chút để test cho nhanh
+        test_loader_final = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False, num_workers=self.num_workers)
+        
+        acc = self.compute_test_acc(test_loader_final)
+        self.logger.info(f" >>>>>> FINAL TEST ACCURACY TASK {self.cur_task}: {acc} % <<<<<<")
+        print(f" >>>>>> FINAL TEST ACCURACY TASK {self.cur_task}: {acc} % <<<<<<")
+
+        del test_set, test_loader_final
+        self._clear_gpu()
 
     def increment_train(self, data_manger):
         self.cur_task += 1
@@ -207,6 +221,20 @@ class MinNet(object):
         del train_set, test_set, train_loader, test_loader
         self._clear_gpu()
 
+        # --- THÊM ĐOẠN NÀY ĐỂ IN TEST ACC NGAY LẬP TỨC ---
+        self.logger.info(f"End of Task {self.cur_task}. Calculating Test Accuracy...")
+        _, test_list, _ = data_manger.get_task_list(self.cur_task)
+        test_set = data_manger.get_task_data(source="test", class_list=test_list)
+        test_set.labels = self.cat2order(test_set.labels, data_manger)
+        # Dùng batch_size lớn chút để test cho nhanh
+        test_loader_final = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False, num_workers=self.num_workers)
+        
+        acc = self.compute_test_acc(test_loader_final)
+        self.logger.info(f" >>>>>> FINAL TEST ACCURACY TASK {self.cur_task}: {acc} % <<<<<<")
+        print(f" >>>>>> FINAL TEST ACCURACY TASK {self.cur_task}: {acc} % <<<<<<")
+        
+        del test_set, test_loader_final
+        self._clear_gpu()
     def fit_fc(self, train_loader, test_loader):
         self._network.eval()
         self._network.to(self.device)
