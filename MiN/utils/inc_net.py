@@ -55,7 +55,7 @@ class RandomBuffer(torch.nn.Linear):
         self.bias = None
         self.in_features = in_features
         self.out_features = buffer_size
-        factory_kwargs = {"device": device, "dtype": torch.double}
+        factory_kwargs = {"device": device, "dtype": torch.float32}
         # self.W = torch.empty((self.out_features, self.in_features), **factory_kwargs)
         self.W = torch.empty((self.in_features, self.out_features), **factory_kwargs)
         self.register_buffer("weight", self.W)
@@ -82,7 +82,7 @@ class MiNbaseNet(nn.Module):
 
         self.buffer = RandomBuffer(in_features=self.feature_dim, buffer_size=self.buffer_size, device=self.device)
 
-        factory_kwargs = {"device": self.device, "dtype": torch.double}
+        factory_kwargs = {"device": self.device, "dtype": torch.float32}
 
         weight = torch.zeros((self.buffer_size, 0), **factory_kwargs)
         self.register_buffer("weight", weight)
