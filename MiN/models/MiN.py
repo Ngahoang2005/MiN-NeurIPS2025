@@ -273,6 +273,7 @@ class MinNet(object):
         else: self._network.unfreeze_noise()
             
         params = filter(lambda p: p.requires_grad, self._network.parameters())
+        self._clear_gpu()
         optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
 
@@ -467,6 +468,8 @@ class MinNet(object):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            # Thêm dòng này để xóa sạch các phân mảnh bộ nhớ
+            torch.cuda.ipc_collect() 
             torch.cuda.synchronize()
 
 class CFS_Module(nn.Module):
