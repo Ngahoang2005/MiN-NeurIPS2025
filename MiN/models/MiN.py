@@ -455,7 +455,6 @@ class MinNet(object):
         return (torch.mean(all_means, dim=0), torch.mean(all_stds, dim=0))        
     # bản khởi tạo index xịn
     def get_task_prototype_cfs(self, model, train_loader):
-        model.to(self.device)
         model.eval()
         device = self.device
         feature_dim = self._network.feature_dim
@@ -463,55 +462,62 @@ class MinNet(object):
         all_real_features = []
         all_real_targets = []
         
-        # 1. Thu thập feature an toàn
+        # 1. Thu thập feature an toàn (Giải quyết Peak 5.64GB ban đầu)
         with torch.no_grad():
             for _, inputs, targets in train_loader:
-                inputs = inputs.to(device)
-                # Dùng autocast ngay cả khi trích xuất feature để tiết kiệm RAM
+                inputs = inputs.to(device).float() # Đảm bảo float32 để khớp weight backbone
+                # Sử dụng cú pháp autocast mới để tiết kiệm RAM khi extract
+                with torch.amp.autocast('cuda'):
+                    feat = model.extract_feature(inputs)
                 
-                feat = model.extract_feature(inputs)
+                # .detach().cpu() là bắt buộc để giải phóng RAM GPU ngay lập tức
                 all_real_features.append(feat.detach().cpu())
                 all_real_targets.append(targets.cpu())
+                
+                # Xóa biến tạm và cache sau mỗi batch
                 del inputs, feat
-        
+            torch.cuda.empty_cache()
+
         all_real_features = torch.cat(all_real_features, dim=0)
         all_real_targets = torch.cat(all_real_targets, dim=0)
         unique_classes = torch.unique(all_real_targets)
         
         prototypes = {}
 
+        # --- CHẠY CFS CHO TỪNG CLASS ---
         for cls in unique_classes:
             cls_mask = (all_real_targets == cls)
             cls_real = all_real_features[cls_mask]
             
-            # GIỚI HẠN MẪU: Nếu class quá đông, chỉ lấy 300 mẫu ngẫu nhiên
-            if cls_real.size(0) > 300:
-                indices = torch.randperm(cls_real.size(0))[:300]
+            # GIỚI HẠN MẪU: Giảm xuống 200 mẫu là đủ để tính toán phân phối
+            if cls_real.size(0) > 200:
+                indices = torch.randperm(cls_real.size(0))[:200]
                 cls_real = cls_real[indices]
             
             cls_real = cls_real.to(device)
             cls_mean = torch.mean(cls_real, dim=0)
             cls_std = torch.std(cls_real, dim=0) + EPSILON
 
-            # 2. Train f_cont ngắn hạn
+            # 2. Train f_cont ngắn hạn (Dùng Mixed Precision)
             f_cont = CFS_Mapping(feature_dim).to(device)
             optimizer = torch.optim.Adam(f_cont.parameters(), lr=1e-3)
             criterion = NegativeContrastiveLoss(tau=0.1)
             
             f_cont.train()
-            for _ in range(15): # Giảm xuống 15 epoch để nhanh hơn
-                with torch.cuda.amp.autocast():
+            for _ in range(15):
+                with torch.amp.autocast('cuda'):
                     embeddings = f_cont(cls_real)
                     loss = criterion(embeddings)
+                
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
             
-            # 3. Greedy Selection
+            # 3. Greedy Selection (Tối ưu hóa bộ nhớ ma trận tương đồng)
             f_cont.eval()
             all_selected_feats = None
             samples_needed = 20
-            sup_batch = 50 # Giảm batch ứng viên xuống 50 để tránh sim_matrix quá lớn
+            sup_batch = 50 # Giữ ở 50 để ma trận sim không quá lớn
             
             with torch.no_grad():
                 for step in range(samples_needed):
@@ -521,28 +527,38 @@ class MinNet(object):
                     if all_selected_feats is None:
                         all_selected_feats = candidate_feats[:5]
                     else:
-                        with torch.cuda.amp.autocast():
+                        with torch.amp.autocast('cuda'):
+                            # Normalize để tính Cosine Similarity hiệu quả
                             cont_cand = F.normalize(f_cont(candidate_feats), dim=1)
                             cont_selected = F.normalize(f_cont(all_selected_feats), dim=1)
+                            # Phép nhân ma trận [50x768] * [768xN]
                             sim_matrix = torch.matmul(cont_cand, cont_selected.t())
                             avg_sim = torch.mean(sim_matrix, dim=1)
                         
                         slt_ids = torch.argsort(avg_sim)[:1]
                         all_selected_feats = torch.cat([all_selected_feats, candidate_feats[slt_ids]], dim=0)
+                    
                     del eps, candidate_feats
-
+            
+            # Đẩy kết quả về CPU trước khi xóa class data
             prototypes[cls.item()] = (torch.mean(all_selected_feats, dim=0).cpu(), 
                                       torch.std(all_selected_feats, dim=0).cpu())
             
-            # DỌN DẸP TRIỆT ĐỂ sau mỗi class
+            # GIẢI PHÓNG TRIỆT ĐỂ SAU MỖI CLASS
             del f_cont, optimizer, criterion, cls_real, all_selected_feats
             self._clear_gpu()
 
+        # MiN aggregation
         all_means = torch.stack([p[0] for p in prototypes.values()])
         all_stds = torch.stack([p[1] for p in prototypes.values()])
         
-        del all_real_features, all_real_targets
-        return (torch.mean(all_means, dim=0), torch.mean(all_stds, dim=0))
+        final_res = (torch.mean(all_means, dim=0), torch.mean(all_stds, dim=0))
+        
+        # Dọn dẹp loader rác còn lại
+        del all_real_features, all_real_targets, prototypes
+        self._clear_gpu()
+        
+        return final_res
     def _clear_gpu(self):
         """Hàm dọn dẹp tổng lực"""
         gc.collect()
