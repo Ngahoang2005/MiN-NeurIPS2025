@@ -401,6 +401,9 @@ class MinNet(object):
             criterion = NegativeContrastiveLoss(tau=0.1)
             
             f_cont.train()
+            prev_loss = float('inf')
+            patience = 5
+            counter = 0
             for _ in range(10): 
                 with autocast('cuda'): # Dùng autocast khi train để tiết kiệm
                     embeddings = f_cont(cls_real)
@@ -409,7 +412,12 @@ class MinNet(object):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-            
+                if abs(prev_loss - loss.item()) < 1e-6:
+                    counter += 1
+                    if counter >= patience: break
+                else:
+                    counter = 0
+                prev_loss = loss.item()
             # 3. Greedy Selection (Tìm Anchors)
             f_cont.eval()
             all_selected_feats = None
