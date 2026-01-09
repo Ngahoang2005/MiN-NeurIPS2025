@@ -402,7 +402,7 @@ class MinNet(object):
             
             f_cont.train()
             
-            for _ in range(30): 
+            for _ in range(20): 
                 with autocast('cuda'): # Dùng autocast khi train để tiết kiệm
                     embeddings = f_cont(cls_real)
                     loss = criterion(embeddings)
@@ -414,8 +414,8 @@ class MinNet(object):
             # 3. Greedy Selection (Tìm Anchors)
             f_cont.eval()
             all_selected_feats = None
-            samples_needed = 20
-            sup_batch = 50 
+            samples_needed = 40
+            sup_batch = 60
             
             with torch.no_grad():
                 for step in range(samples_needed):
