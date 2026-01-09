@@ -402,7 +402,7 @@ class MinNet(object):
             
             f_cont.train()
             
-            for _ in range(20): 
+            for _ in range(30): 
                 with autocast('cuda'): # Dùng autocast khi train để tiết kiệm
                     embeddings = f_cont(cls_real)
                     loss = criterion(embeddings)
@@ -420,7 +420,7 @@ class MinNet(object):
             with torch.no_grad():
                 for step in range(samples_needed):
                     eps = torch.randn([sup_batch, feature_dim], device=device)
-                    # Tạo mẫu ảo từ thống kê thô
+                    # Tạo vmẫu ảo từ thống kê thô
                     mean_temp = torch.mean(cls_real, dim=0)
                     std_temp = torch.std(cls_real, dim=0) + EPSILON
                     candidate_feats = eps * std_temp + mean_temp
