@@ -164,6 +164,7 @@ class MinNet(object):
 
         del test_set, test_loader_final
         self._clear_gpu()
+        self.after_train(data_manger)
 
     def increment_train(self, data_manger):
         self.cur_task += 1
@@ -235,6 +236,7 @@ class MinNet(object):
         
         del test_set, test_loader_final
         self._clear_gpu()
+        self.after_train(data_manger)
     def fit_fc(self, train_loader, test_loader):
         self._network.eval()
         self._network.to(self.device)
