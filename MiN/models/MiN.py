@@ -140,8 +140,7 @@ class MinNet(object):
         self.re_fit(train_loader, test_loader)
         self._clear_gpu()
         
-        # 6. Final Evaluation
-        self.after_train(data_manger)
+    
 
     def increment_train(self, data_manger):
         self.cur_task += 1
@@ -222,8 +221,7 @@ class MinNet(object):
         self.re_fit(train_loader, test_loader)
         self._clear_gpu()
 
-        # 6. Evaluation
-        self.after_train(data_manger)
+        
 
     # =========================================================================
     #  PHẦN 2: CORE TRAINING FUNCTIONS (Run, Fit)
@@ -497,23 +495,18 @@ class MinNet(object):
         else:
             self.known_class += self.increment
 
-        # Lấy toàn bộ class cũ để test (Cumulative Evaluation)
-        all_classes_so_far = []
-        for t in range(self.cur_task + 1):
-            _, t_list, _ = data_manger.get_task_list(t)
-            all_classes_so_far.extend(t_list)
-
-        test_set = data_manger.get_task_data(source="test", class_list=all_classes_so_far)
+        _, test_list, _ = data_manger.get_task_list(self.cur_task)
+        test_set = data_manger.get_task_data(source="test", class_list=test_list)
         test_set.labels = self.cat2order(test_set.labels, data_manger)
-        test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False, num_workers=self.num_workers)
-        
+        test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False,
+                                 num_workers=self.num_workers)
         eval_res = self.eval_task(test_loader)
         self.total_acc.append(round(float(eval_res['all_class_accy']*100.), 2))
         self.logger.info('total acc: {}'.format(self.total_acc))
         self.logger.info('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
-        
-        # Clean print
-        print(f"Task {self.cur_task} Finished. Avg Acc: {np.mean(self.total_acc):.2f}%")
+        self.logger.info('task_confusion_metrix:\n{}'.format(eval_res['task_confusion']))
+        print('total acc: {}'.format(self.total_acc))
+        print('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
         del test_set
 
     def eval_task(self, test_loader):
