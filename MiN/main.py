@@ -1,7 +1,9 @@
 import json
 import argparse
 from trainer.BaseTrainer import train
-
+import os
+# Kích hoạt chế độ quản lý bộ nhớ thông minh của PyTorch
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 def main():
     args = setup_parser().parse_args()

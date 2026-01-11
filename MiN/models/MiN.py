@@ -263,6 +263,20 @@ class MinNet(object):
             prog_bar.set_description(info)
 
     def run(self, train_loader):
+        # 1. CẤU HÌNH GRADIENT ACCUMULATION
+        # ------------------------------------------------------------------
+        # Batch size bạn mong muốn (để giữ nguyên kết quả toán học cũ)
+        TARGET_BATCH_SIZE = 128 
+        
+        # Batch size thực tế GPU đang chạy (đã sửa trong JSON, ví dụ 32)
+        ACTUAL_BATCH_SIZE = self.batch_size 
+        
+        # Tính số bước cần tích lũy (Ví dụ: 128 / 32 = 4 bước)
+        grad_accum_steps = max(1, TARGET_BATCH_SIZE // ACTUAL_BATCH_SIZE)
+        
+        self.logger.info(f"Gradient Accumulation Activated: Real BS={ACTUAL_BATCH_SIZE}, Target BS={TARGET_BATCH_SIZE}, Steps={grad_accum_steps}")
+        # ------------------------------------------------------------------
+
         if self.cur_task == 0:
             epochs, lr, weight_decay = self.init_epochs, self.init_lr, self.init_weight_decay
         else:
@@ -275,28 +289,36 @@ class MinNet(object):
         else: self._network.unfreeze_noise()
             
         params = filter(lambda p: p.requires_grad, self._network.parameters())
+        
+        # Dọn dẹp GPU trước khi train
         self._clear_gpu()
+        
         optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
 
-        # Gradient Checkpointing (Tắt nếu model quá nhỏ hoặc không hỗ trợ)
+        # Gradient Checkpointing (Giúp giảm thêm VRAM nếu cần)
         if hasattr(self._network.backbone, 'set_grad_checkpointing'):
             self._network.backbone.set_grad_checkpointing(True)
-            self.logger.info("Gradient Checkpointing activated.")
+        elif hasattr(self._network.backbone, 'model') and hasattr(self._network.backbone.model, 'set_grad_checkpointing'):
+             self._network.backbone.model.set_grad_checkpointing(True)
 
-        scaler = GradScaler('cuda') # Update cú pháp mới
+        scaler = GradScaler('cuda') 
         prog_bar = tqdm(range(epochs))
         
         self._network.train()
         self._network.to(self.device)
 
+        # Reset gradient ngay từ đầu
+        optimizer.zero_grad()
+
         for _, epoch in enumerate(prog_bar):
             losses, correct, total = 0.0, 0, 0
+            
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
-                optimizer.zero_grad()
                 
-                with autocast('cuda'): # Update cú pháp mới
+                # Forward pass
+                with autocast('cuda'):
                     if self.cur_task > 0:
                         outputs1 = self._network(inputs, new_forward=False)
                         outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
@@ -306,16 +328,30 @@ class MinNet(object):
                         logits_final = outputs["logits"]
                     
                     loss = F.cross_entropy(logits_final, targets.long())
+                    
+                    # --- [KEY CHANGE 1] CHIA NHỎ LOSS ---
+                    # Để trung bình gradient của 4 bước nhỏ = gradient của 1 bước lớn
+                    loss = loss / grad_accum_steps
 
+                # --- [KEY CHANGE 2] BACKWARD TÍCH LŨY ---
                 scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-
-                losses += loss.item()
+                
+                # Tính toán log (nhân lại để hiển thị đúng giá trị loss thực tế)
+                losses += loss.item() * grad_accum_steps 
                 _, preds = torch.max(logits_final, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
-                del inputs, targets, logits_final, loss # Xóa ngay lập tức
+
+                # --- [KEY CHANGE 3] UPDATE SAU KHI ĐỦ BƯỚC ---
+                # Chỉ update trọng số khi đã chạy đủ số bước tích lũy
+                # hoặc khi hết dữ liệu của epoch (để không bỏ sót batch cuối)
+                if (i + 1) % grad_accum_steps == 0 or (i + 1) == len(train_loader):
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad() # Chỉ xóa grad sau khi đã update
+                
+                # Dọn dẹp ngay lập tức
+                del inputs, targets, logits_final, loss 
         
             scheduler.step()
             train_acc = 100. * correct / total
@@ -326,7 +362,6 @@ class MinNet(object):
         
         del optimizer, scheduler
         self._clear_gpu()
-
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
@@ -416,8 +451,8 @@ class MinNet(object):
             # 3. Greedy Selection (Tìm Anchors)
             f_cont.eval()
             all_selected_feats = None
-            samples_needed = 40
-            sup_batch = 60
+            samples_needed = 20
+            sup_batch = 50
             
             with torch.no_grad():
                 for step in range(samples_needed):
