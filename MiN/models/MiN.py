@@ -61,16 +61,20 @@ class MinNet(object):
             self.known_class = self.init_class
         else:
             self.known_class += self.increment
+
         _, test_list, _ = data_manger.get_task_list(self.cur_task)
         test_set = data_manger.get_task_data(source="test", class_list=test_list)
         test_set.labels = self.cat2order(test_set.labels, data_manger)
-        test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False, num_workers=self.num_workers)
+        test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False,
+                                 num_workers=self.num_workers)
         eval_res = self.eval_task(test_loader)
         self.total_acc.append(round(float(eval_res['all_class_accy']*100.), 2))
         self.logger.info('total acc: {}'.format(self.total_acc))
         self.logger.info('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
+        self.logger.info('task_confusion_metrix:\n{}'.format(eval_res['task_confusion']))
+        print('total acc: {}'.format(self.total_acc))
+        print('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
         del test_set
-
     def save_check_point(self, path_name):
         torch.save(self._network.state_dict(), path_name)
 
@@ -304,20 +308,6 @@ class MinNet(object):
             prog_bar.set_description(info)
 
     def run(self, train_loader):
-        # 1. CẤU HÌNH GRADIENT ACCUMULATION
-        # ------------------------------------------------------------------
-        # Batch size bạn mong muốn (để giữ nguyên kết quả toán học cũ)
-        TARGET_BATCH_SIZE = 128 
-        
-        # Batch size thực tế GPU đang chạy (đã sửa trong JSON, ví dụ 32)
-        ACTUAL_BATCH_SIZE = self.batch_size 
-        
-        # Tính số bước cần tích lũy (Ví dụ: 128 / 32 = 4 bước)
-        grad_accum_steps = max(1, TARGET_BATCH_SIZE // ACTUAL_BATCH_SIZE)
-        
-        self.logger.info(f"Gradient Accumulation Activated: Real BS={ACTUAL_BATCH_SIZE}, Target BS={TARGET_BATCH_SIZE}, Steps={grad_accum_steps}")
-        # ------------------------------------------------------------------
-
         if self.cur_task == 0:
             epochs, lr, weight_decay = self.init_epochs, self.init_lr, self.init_weight_decay
         else:
@@ -330,36 +320,28 @@ class MinNet(object):
         else: self._network.unfreeze_noise()
             
         params = filter(lambda p: p.requires_grad, self._network.parameters())
-        
-        # Dọn dẹp GPU trước khi train
         self._clear_gpu()
-        
         optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
 
-        # Gradient Checkpointing (Giúp giảm thêm VRAM nếu cần)
+        # Gradient Checkpointing (Tắt nếu model quá nhỏ hoặc không hỗ trợ)
         if hasattr(self._network.backbone, 'set_grad_checkpointing'):
             self._network.backbone.set_grad_checkpointing(True)
-        elif hasattr(self._network.backbone, 'model') and hasattr(self._network.backbone.model, 'set_grad_checkpointing'):
-             self._network.backbone.model.set_grad_checkpointing(True)
+            self.logger.info("Gradient Checkpointing activated.")
 
-        scaler = GradScaler('cuda') 
+        scaler = GradScaler('cuda') # Update cú pháp mới
         prog_bar = tqdm(range(epochs))
         
         self._network.train()
         self._network.to(self.device)
 
-        # Reset gradient ngay từ đầu
-        optimizer.zero_grad()
-
         for _, epoch in enumerate(prog_bar):
             losses, correct, total = 0.0, 0, 0
-            
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
+                optimizer.zero_grad()
                 
-                # Forward pass
-                with autocast('cuda'):
+                with autocast('cuda'): # Update cú pháp mới
                     if self.cur_task > 0:
                         outputs1 = self._network(inputs, new_forward=False)
                         outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
@@ -369,30 +351,16 @@ class MinNet(object):
                         logits_final = outputs["logits"]
                     
                     loss = F.cross_entropy(logits_final, targets.long())
-                    
-                    # --- [KEY CHANGE 1] CHIA NHỎ LOSS ---
-                    # Để trung bình gradient của 4 bước nhỏ = gradient của 1 bước lớn
-                    loss = loss / grad_accum_steps
 
-                # --- [KEY CHANGE 2] BACKWARD TÍCH LŨY ---
                 scaler.scale(loss).backward()
-                
-                # Tính toán log (nhân lại để hiển thị đúng giá trị loss thực tế)
-                losses += loss.item() * grad_accum_steps 
+                scaler.step(optimizer)
+                scaler.update()
+
+                losses += loss.item()
                 _, preds = torch.max(logits_final, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
-
-                # --- [KEY CHANGE 3] UPDATE SAU KHI ĐỦ BƯỚC ---
-                # Chỉ update trọng số khi đã chạy đủ số bước tích lũy
-                # hoặc khi hết dữ liệu của epoch (để không bỏ sót batch cuối)
-                if (i + 1) % grad_accum_steps == 0 or (i + 1) == len(train_loader):
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad() # Chỉ xóa grad sau khi đã update
-                
-                # Dọn dẹp ngay lập tức
-                del inputs, targets, logits_final, loss 
+                del inputs, targets, logits_final, loss # Xóa ngay lập tức
         
             scheduler.step()
             train_acc = 100. * correct / total
@@ -403,6 +371,7 @@ class MinNet(object):
         
         del optimizer, scheduler
         self._clear_gpu()
+
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
@@ -429,20 +398,31 @@ class MinNet(object):
     #  PHẦN CFS PROTOTYPE CẢI TIẾN & TỐI ƯU OOM
     # =========================================================================
     def get_task_prototype_cfs(self, model, train_loader):
-        device = self.device
-        model.to(device).float().eval()
+        device = self.device  # Lấy device từ class
+        
+        # --- FIX LỖI QUAN TRỌNG: Đẩy Model lên GPU và ép kiểu Float32 ---
+        model.to(device)      # Bắt buộc: Đưa trọng số model lên GPU
+        model.float()         # Bắt buộc: Ép về float32 để tránh lỗi mismatch với input
+        model.eval()
         feature_dim = self._network.feature_dim
         
-        # --- Phần 1: Thu thập Feature (Giữ nguyên code cũ của bạn) ---
         all_real_features = []
         all_real_targets = []
         
+        model.float() # Đảm bảo model ở float32 trước khi trích xuất
+        
+        # 1. Thu thập feature an toàn (Tránh OOM)
         with torch.no_grad():
             for _, inputs, targets in train_loader:
-                inputs = inputs.to(device).float()
+                # ÉP INPUT VỀ FLOAT32 ĐỂ KHỚP VỚI WEIGHTS (Fix lỗi mismatch kiểu dữ liệu)
+                inputs = inputs.to(device).float() 
+                
+                # KHÔNG dùng autocast ở đây (extract_feature no_grad đã nhẹ rồi)
                 feat = model.extract_feature(inputs)
+                
                 all_real_features.append(feat.detach().cpu())
                 all_real_targets.append(targets.cpu())
+                del inputs, feat
             torch.cuda.empty_cache()
 
         all_real_features = torch.cat(all_real_features, dim=0)
@@ -451,45 +431,87 @@ class MinNet(object):
         
         prototypes = {}
 
-        # --- Phần 2: Chạy CFS cho từng Class (Giữ nguyên logic CFS) ---
         for cls in unique_classes:
             cls_mask = (all_real_targets == cls)
             cls_real = all_real_features[cls_mask]
             
+            # GIỚI HẠN MẪU: 200 mẫu là đủ, tránh ma trận quá lớn
             if cls_real.size(0) > 200:
                 indices = torch.randperm(cls_real.size(0))[:200]
                 cls_real = cls_real[indices]
             
             cls_real = cls_real.to(device).float()
 
-            # ... (Đoạn code Train CFS và Greedy Selection giữ nguyên) ...
-            # ... (Giả sử bạn giữ nguyên đoạn code train f_cont và chọn anchors ở đây) ...
-            # ... Để code gọn, tôi không paste lại đoạn train 20 epoch ở đây nhé ...
+            # 2. Train f_cont ngắn hạn
+            f_cont = CFS_Mapping(feature_dim).to(device).float()
+            optimizer = torch.optim.Adam(f_cont.parameters(), lr=1e-3)
+            criterion = NegativeContrastiveLoss(tau=0.1)
             
-            # --- Giả lập kết quả sau khi Refinement ---
-            # (Bạn paste đoạn Refinement của bạn vào đây)
-            # Ví dụ kết quả cuối cùng của 1 class:
-            # refined_mean = ...
-            # refined_std = ...
+            f_cont.train()
             
-            # Lưu ý: refined_mean phải move về CPU để tiết kiệm GPU cho các bước sau
+            for _ in range(20): 
+                with autocast('cuda'): # Dùng autocast khi train để tiết kiệm
+                    embeddings = f_cont(cls_real)
+                    loss = criterion(embeddings)
+                
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+            
+            # 3. Greedy Selection (Tìm Anchors)
+            f_cont.eval()
+            all_selected_feats = None
+            samples_needed = 40
+            sup_batch = 60
+            
+            with torch.no_grad():
+                for step in range(samples_needed):
+                    eps = torch.randn([sup_batch, feature_dim], device=device)
+                    # Tạo vmẫu ảo từ thống kê thô
+                    mean_temp = torch.mean(cls_real, dim=0)
+                    std_temp = torch.std(cls_real, dim=0) + EPSILON
+                    candidate_feats = eps * std_temp + mean_temp
+                    
+                    if all_selected_feats is None:
+                        all_selected_feats = candidate_feats[:5]
+                    else:
+                        with autocast('cuda'):
+                            cont_cand = f_cont(candidate_feats) # Đã normalize trong forward
+                            cont_selected = f_cont(all_selected_feats)
+                            sim_matrix = torch.matmul(cont_cand, cont_selected.t())
+                            avg_sim = torch.mean(sim_matrix, dim=1)
+                        
+                        slt_ids = torch.argsort(avg_sim)[:1]
+                        all_selected_feats = torch.cat([all_selected_feats, candidate_feats[slt_ids]], dim=0)
+                    del eps, candidate_feats
+
+            # 4. Refinement: Tính Mean/Std dựa trên trọng số từ Anchors
+            with torch.no_grad():
+                with autocast('cuda'):
+                    z_real = f_cont(cls_real)
+                    z_anchors = f_cont(all_selected_feats)
+                    sim_matrix = torch.matmul(z_real, z_anchors.t())
+                    max_sim, _ = torch.max(sim_matrix, dim=1)
+                    weights = F.softmax(max_sim / 0.1, dim=0)
+                
+                # Tính Weighted Mean & Std
+                refined_mean = torch.sum(cls_real * weights.unsqueeze(1), dim=0)
+                variance = torch.sum(weights.unsqueeze(1) * (cls_real - refined_mean)**2, dim=0)
+                refined_std = torch.sqrt(variance + EPSILON)
+
             prototypes[cls.item()] = (refined_mean.detach().cpu(), refined_std.detach().cpu())
             
-            # Dọn dẹp
-            del cls_real
-            torch.cuda.empty_cache()
+            del f_cont, optimizer, criterion, cls_real, all_selected_feats, weights
+            self._clear_gpu()
 
-        # --- PHẦN QUAN TRỌNG: THAY ĐỔI OUTPUT ---
-        # Gom tất cả mean của các lớp lại thành 1 Tensor [Số_lớp, Feature_Dim]
         all_means = torch.stack([p[0] for p in prototypes.values()])
         all_stds = torch.stack([p[1] for p in prototypes.values()])
         
         del all_real_features, all_real_targets, prototypes
         self._clear_gpu()
         
-        # TRẢ VỀ CẢ CỤM (Không tính torch.mean dim=0 nữa)
-        # Output shape: ([N_classes, 768], [N_classes, 768])
-        return all_means, all_stds
+        return (torch.mean(all_means, dim=0), torch.mean(all_stds, dim=0))
+
     def _clear_gpu(self):
         gc.collect()
         if torch.cuda.is_available():
@@ -497,65 +519,49 @@ class MinNet(object):
             # Thêm dòng này để xóa sạch các phân mảnh bộ nhớ
             torch.cuda.ipc_collect() 
             torch.cuda.synchronize()
+    # =========================================================================
+    #  CÁC HÀM TÍNH TOÁN TRỌNG SỐ THÔNG MINH (CLASS-WISE MATCHING)
+    # =========================================================================
     def calculate_smart_similarity(self, proto_new, proto_old):
         """
-        Tính độ giống nhau giữa 2 Task dựa trên so khớp từng cặp (Best Match).
-        
-        Args:
-            proto_new: Tensor [N_new_classes, 768] (Task hiện tại)
-            proto_old: Tensor [N_old_classes, 768] (Task quá khứ)
-        Returns:
-            score: Một con số (scalar) thể hiện độ giống nhau.
+        So khớp từng cặp Class giữa Task Mới và Task Cũ để tìm độ tương đồng tốt nhất.
         """
         device = self.device
-        
-        # Đưa lên GPU để tính toán cho nhanh (vì chỉ là vector mean nên rất nhẹ)
         z_new = proto_new.to(device)
         z_old = proto_old.to(device)
         
-        # 1. Chuẩn hóa về mặt cầu (để tính Cosine)
+        # Chuẩn hóa
         z_new = F.normalize(z_new, p=2, dim=1)
         z_old = F.normalize(z_old, p=2, dim=1)
         
-        # 2. Tính Ma trận tương đồng (Cosine Similarity Matrix)
-        # Kích thước output: [N_new, N_old]
-        # Hàng i, Cột j là độ giống nhau giữa Class i (mới) và Class j (cũ)
+        # Tính ma trận [N_new, N_old]
         sim_matrix = torch.matmul(z_new, z_old.t())
         
-        # 3. Chiến thuật "Best Match" (Max Pooling)
-        # Với mỗi lớp ở Task Mới, tìm xem lớp nào ở Task Cũ giống nó nhất?
-        # Dim=1 nghĩa là quét qua các cột (các lớp cũ)
+        # Lấy giá trị lớn nhất cho mỗi class mới (Best Match)
         max_sim_values, _ = torch.max(sim_matrix, dim=1)
         
-        # 4. Tính trung bình các cặp tốt nhất
-        # Logic: Độ giống nhau của Task = Trung bình độ giống nhau của các thành viên
-        score = torch.mean(max_sim_values)
-        
-        return score.item()
+        # Trung bình cộng các Best Match
+        return torch.mean(max_sim_values).item()
+
     def compute_noise_weights(self, stored_prototypes, current_prototype):
         """
-        Tính trọng số để trộn Noise từ các Task cũ.
-        
-        Args:
-            stored_prototypes: List chứa các prototype của các task cũ.
-                               Mỗi phần tử là Tensor [N_classes, 768]
-            current_prototype: Prototype của task hiện tại [N_classes, 768]
+        Tính toán danh sách trọng số dựa trên thuật toán Smart Similarity.
         """
+        if not stored_prototypes:
+            return None
+            
         scores = []
+        # current_prototype[0] chứa list các mean của task mới
+        current_means = current_prototype[0] 
         
-        # Duyệt qua từng Task cũ trong quá khứ
         for old_proto in stored_prototypes:
-            # Lấy phần Mean (index 0) để so sánh
-            # old_proto[0] là mean, old_proto[1] là std
-            score = self.calculate_smart_similarity(current_prototype[0], old_proto[0])
+            # old_proto[0] chứa list các mean của task cũ
+            score = self.calculate_smart_similarity(current_means, old_proto[0])
             scores.append(score)
             
         scores = torch.tensor(scores, device=self.device)
-        
-        # Chuyển điểm số thành xác suất (Softmax)
-        # Chia cho nhiệt độ (temperature) 0.1 để làm rõ sự chênh lệch (nếu cần)
+        # Softmax với nhiệt độ 0.1 để làm rõ sự chênh lệch
         weights = F.softmax(scores / 0.1, dim=0)
-        
         return weights
 class CFS_Module(nn.Module):
     def __init__(self, feature_dim):
