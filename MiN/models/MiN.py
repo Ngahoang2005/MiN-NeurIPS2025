@@ -446,16 +446,48 @@ class MinNet(object):
         return torch.mean(max_sim_values).item()
 
     def compute_noise_weights(self, stored_prototypes, current_prototype):
-        if not stored_prototypes: return None
+        """
+        Phiên bản cải tiến: Top-k Smoothing.
+        Tránh hiện tượng 'Winner-takes-all' của Softmax nhiệt độ thấp.
+        """
+        if not stored_prototypes:
+            return None
+            
         scores = []
         current_means = current_prototype[0] 
+        
+        # 1. Tính Similarity (Cosine)
         for old_proto in stored_prototypes:
             score = self.calculate_smart_similarity(current_means, old_proto[0])
             scores.append(score)
+            
         scores = torch.tensor(scores, device=self.device)
-        weights = F.softmax(scores / 0.1, dim=0)
-        return weights
+        
+        # 2. CẤU HÌNH KHẮC PHỤC OVERFITTING
+        # ---------------------------------------------------------
+        K_TOP = min(len(scores), 3)  # Chỉ lấy Top 3 task giống nhất (giữ sự liên quan)
+        TEMP = 0.5                   # Tăng nhiệt độ từ 0.1 -> 0.5 (giữ sự đa dạng)
+        # ---------------------------------------------------------
 
+        # 3. Chọn Top-k
+        # Lấy giá trị và chỉ số của k task giống nhất
+        topk_scores, topk_indices = torch.topk(scores, K_TOP)
+        
+        # 4. Softmax trên Top-k với nhiệt độ cao hơn
+        # Mask: Tạo vector 0 toàn bộ
+        final_weights = torch.zeros_like(scores)
+        
+        # Tính softmax chỉ trên các phần tử top-k
+        # Việc tăng Tau lên 0.5 giúp phân phối mượt hơn (0.9 và 0.8 sẽ có weight gần nhau hơn)
+        topk_weights = F.softmax(topk_scores / TEMP, dim=0)
+        
+        # Gán ngược lại vào vector tổng
+        final_weights[topk_indices] = topk_weights
+        
+        # Log để kiểm tra độ peaky
+        # self.logger.info(f"Top-{K_TOP} Weights (T={TEMP}): {final_weights[topk_indices].cpu().numpy()}")
+        
+        return final_weights
     # =========================================================================
     #  PHẦN 4: EVALUATION & UTILS
     # =========================================================================
