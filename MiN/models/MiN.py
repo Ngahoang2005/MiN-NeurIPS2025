@@ -97,15 +97,8 @@ class MinNet(object):
         
         # 1. Tính Prototype ban đầu
         # Lưu ý: Ở Task 0 chưa cần Smart Weight nên ta lấy bản gộp (aggregated)
-        current_proto_full = self.get_task_prototype_cfs(self._network, train_loader)
-        
-        # Lưu bản chi tiết cho tương lai
-        self.advanced_prototypes.append(current_proto_full)
-        
-        # Tạo bản gộp để tương thích MiNbaseNet
-        agg_mean = torch.mean(current_proto_full[0], dim=0)
-        agg_std = torch.mean(current_proto_full[1], dim=0)
-        self._network.extend_task_prototype((agg_mean, agg_std))
+        prototype = self.get_task_prototype_cfs(self._network, train_loader)
+        self._network.extend_task_prototype(prototype)
         
         self._clear_gpu()
 
@@ -114,12 +107,10 @@ class MinNet(object):
         self._clear_gpu()
 
         # 3. Refinement Prototype
-        current_proto_full = self.get_task_prototype_cfs(self._network, train_loader)
-        self.advanced_prototypes[0] = current_proto_full # Update kho
-        
-        agg_mean = torch.mean(current_proto_full[0], dim=0)
-        agg_std = torch.mean(current_proto_full[1], dim=0)
-        self._network.update_task_prototype((agg_mean, agg_std))
+        prototype = self.get_task_prototype_cfs(self._network, train_loader)
+        self._network.update_task_prototype(prototype)
+
+       
         
         del train_loader, test_loader
         
@@ -170,40 +161,13 @@ class MinNet(object):
         train_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
         self._network.update_noise()
         
-        # --- SMART WEIGHTS LOGIC ---
-        current_proto_full = self.get_task_prototype_cfs(self._network, train_loader)
-        
-        if len(self.advanced_prototypes) > 0:
-            smart_weights = self.compute_noise_weights(self.advanced_prototypes, current_proto_full)
-            self.logger.info(f"Task {self.cur_task} Smart Weights: {smart_weights.cpu().numpy()}")
-            
-            # Gán trọng số vào module noise (Tùy chỉnh theo tên biến trong MiNbaseNet)
-            if hasattr(self._network, 'noise_module') and hasattr(self._network.noise_module, 'weight'):
-                 with torch.no_grad():
-                     self._network.noise_module.weight.data = smart_weights
-            elif hasattr(self._network, 'weight_noise'):
-                 self._network.weight_noise = smart_weights
-
-        # Tương thích ngược: Gộp prototype lại để lưu vào list cũ
-        agg_mean = torch.mean(current_proto_full[0], dim=0)
-        agg_std = torch.mean(current_proto_full[1], dim=0)
-        self._network.extend_task_prototype((agg_mean, agg_std))
-        
-        # Lưu bản chi tiết
-        self.advanced_prototypes.append(current_proto_full)
+        prototype = self.get_task_prototype_cfs(self._network, train_loader)
+        self._network.extend_task_prototype(prototype)
         self._clear_gpu()
-
-        # 3. Train Noise (Gradient Accumulation)
-        self.run(train_loader)
-        self._clear_gpu()
-
+       
         # 4. Refinement sau train
-        current_proto_full = self.get_task_prototype_cfs(self._network, train_loader)
-        self.advanced_prototypes[self.cur_task] = current_proto_full
-        
-        agg_mean = torch.mean(current_proto_full[0], dim=0)
-        agg_std = torch.mean(current_proto_full[1], dim=0)
-        self._network.update_task_prototype((agg_mean, agg_std))
+        prototype = self.get_task_prototype_cfs(self._network, train_loader)
+        self._network.update_task_prototype(prototype)
         
         del train_set, train_loader
         self._clear_gpu()
@@ -334,19 +298,31 @@ class MinNet(object):
     #  PHẦN 3: CFS & SMART SIMILARITY
     # =========================================================================
     def get_task_prototype_cfs(self, model, train_loader):
-        device = self.device
-        model.to(device).float().eval()
+        device = self.device  # Lấy device từ class
+        
+        # --- FIX LỖI QUAN TRỌNG: Đẩy Model lên GPU và ép kiểu Float32 ---
+        model.to(device)      # Bắt buộc: Đưa trọng số model lên GPU
+        model.float()         # Bắt buộc: Ép về float32 để tránh lỗi mismatch với input
+        model.eval()
         feature_dim = self._network.feature_dim
         
         all_real_features = []
         all_real_targets = []
         
+        model.float() # Đảm bảo model ở float32 trước khi trích xuất
+        
+        # 1. Thu thập feature an toàn (Tránh OOM)
         with torch.no_grad():
             for _, inputs, targets in train_loader:
-                inputs = inputs.to(device).float()
+                # ÉP INPUT VỀ FLOAT32 ĐỂ KHỚP VỚI WEIGHTS (Fix lỗi mismatch kiểu dữ liệu)
+                inputs = inputs.to(device).float() 
+                
+                # KHÔNG dùng autocast ở đây (extract_feature no_grad đã nhẹ rồi)
                 feat = model.extract_feature(inputs)
+                
                 all_real_features.append(feat.detach().cpu())
                 all_real_targets.append(targets.cpu())
+                del inputs, feat
             torch.cuda.empty_cache()
 
         all_real_features = torch.cat(all_real_features, dim=0)
@@ -359,33 +335,39 @@ class MinNet(object):
             cls_mask = (all_real_targets == cls)
             cls_real = all_real_features[cls_mask]
             
+            # GIỚI HẠN MẪU: 200 mẫu là đủ, tránh ma trận quá lớn
             if cls_real.size(0) > 200:
                 indices = torch.randperm(cls_real.size(0))[:200]
                 cls_real = cls_real[indices]
+            
             cls_real = cls_real.to(device).float()
 
+            # 2. Train f_cont ngắn hạn
             f_cont = CFS_Mapping(feature_dim).to(device).float()
             optimizer = torch.optim.Adam(f_cont.parameters(), lr=1e-3)
             criterion = NegativeContrastiveLoss(tau=0.1)
             
             f_cont.train()
+            
             for _ in range(20): 
-                with autocast('cuda'):
+                with autocast('cuda'): # Dùng autocast khi train để tiết kiệm
                     embeddings = f_cont(cls_real)
                     loss = criterion(embeddings)
+                
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
             
-            # Greedy Selection
+            # 3. Greedy Selection (Tìm Anchors)
             f_cont.eval()
             all_selected_feats = None
             samples_needed = 20
-            sup_batch = 50
+            sup_batch = 50 
             
             with torch.no_grad():
                 for step in range(samples_needed):
                     eps = torch.randn([sup_batch, feature_dim], device=device)
+                    # Tạo mẫu ảo từ thống kê thô
                     mean_temp = torch.mean(cls_real, dim=0)
                     std_temp = torch.std(cls_real, dim=0) + EPSILON
                     candidate_feats = eps * std_temp + mean_temp
@@ -394,15 +376,16 @@ class MinNet(object):
                         all_selected_feats = candidate_feats[:5]
                     else:
                         with autocast('cuda'):
-                            cont_cand = f_cont(candidate_feats)
+                            cont_cand = f_cont(candidate_feats) # Đã normalize trong forward
                             cont_selected = f_cont(all_selected_feats)
                             sim_matrix = torch.matmul(cont_cand, cont_selected.t())
                             avg_sim = torch.mean(sim_matrix, dim=1)
+                        
                         slt_ids = torch.argsort(avg_sim)[:1]
                         all_selected_feats = torch.cat([all_selected_feats, candidate_feats[slt_ids]], dim=0)
                     del eps, candidate_feats
 
-            # Refinement
+            # 4. Refinement: Tính Mean/Std dựa trên trọng số từ Anchors
             with torch.no_grad():
                 with autocast('cuda'):
                     z_real = f_cont(cls_real)
@@ -411,25 +394,23 @@ class MinNet(object):
                     max_sim, _ = torch.max(sim_matrix, dim=1)
                     weights = F.softmax(max_sim / 0.1, dim=0)
                 
+                # Tính Weighted Mean & Std
                 refined_mean = torch.sum(cls_real * weights.unsqueeze(1), dim=0)
                 variance = torch.sum(weights.unsqueeze(1) * (cls_real - refined_mean)**2, dim=0)
                 refined_std = torch.sqrt(variance + EPSILON)
 
             prototypes[cls.item()] = (refined_mean.detach().cpu(), refined_std.detach().cpu())
             
-            # Dọn dẹp nhẹ nhàng (Clean Code)
             del f_cont, optimizer, criterion, cls_real, all_selected_feats, weights
-            torch.cuda.empty_cache()
+            self._clear_gpu()
 
-        # Stack lại thành Tensor [N_class, Dim]
         all_means = torch.stack([p[0] for p in prototypes.values()])
         all_stds = torch.stack([p[1] for p in prototypes.values()])
         
         del all_real_features, all_real_targets, prototypes
         self._clear_gpu()
         
-        # SỬA QUAN TRỌNG: Trả về cả cụm, KHÔNG average tại đây
-        return all_means, all_stds
+        return (torch.mean(all_means, dim=0), torch.mean(all_stds, dim=0))
 
     def calculate_smart_similarity(self, proto_new, proto_old):
         device = self.device
