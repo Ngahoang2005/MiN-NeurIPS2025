@@ -191,12 +191,6 @@ class MinNet(object):
     #  PHẦN 2: CORE TRAINING FUNCTIONS (Run, Fit)
     # =========================================================================
     def run(self, train_loader):
-        # Cấu hình Gradient Accumulation
-        TARGET_BATCH_SIZE = 128
-        ACTUAL_BATCH_SIZE = self.batch_size
-        grad_accum_steps = max(1, TARGET_BATCH_SIZE // ACTUAL_BATCH_SIZE)
-        self.logger.info(f"Grad Accum: Real={ACTUAL_BATCH_SIZE}, Target={TARGET_BATCH_SIZE}, Steps={grad_accum_steps}")
-
         if self.cur_task == 0:
             epochs, lr, weight_decay = self.init_epochs, self.init_lr, self.init_weight_decay
         else:
@@ -210,28 +204,27 @@ class MinNet(object):
             
         params = filter(lambda p: p.requires_grad, self._network.parameters())
         self._clear_gpu()
-        
         optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
 
-        # Gradient Checkpointing (Anti-OOM)
+        # Gradient Checkpointing (Tắt nếu model quá nhỏ hoặc không hỗ trợ)
         if hasattr(self._network.backbone, 'set_grad_checkpointing'):
             self._network.backbone.set_grad_checkpointing(True)
-        elif hasattr(self._network.backbone, 'model') and hasattr(self._network.backbone.model, 'set_grad_checkpointing'):
-             self._network.backbone.model.set_grad_checkpointing(True)
+            self.logger.info("Gradient Checkpointing activated.")
 
-        scaler = GradScaler('cuda') 
+        scaler = GradScaler('cuda') # Update cú pháp mới
         prog_bar = tqdm(range(epochs))
+        
         self._network.train()
         self._network.to(self.device)
-        optimizer.zero_grad()
 
         for _, epoch in enumerate(prog_bar):
             losses, correct, total = 0.0, 0, 0
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
+                optimizer.zero_grad()
                 
-                with autocast('cuda'):
+                with autocast('cuda'): # Update cú pháp mới
                     if self.cur_task > 0:
                         outputs1 = self._network(inputs, new_forward=False)
                         outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
@@ -241,34 +234,26 @@ class MinNet(object):
                         logits_final = outputs["logits"]
                     
                     loss = F.cross_entropy(logits_final, targets.long())
-                    # Chia nhỏ loss để tích lũy
-                    loss = loss / grad_accum_steps
 
                 scaler.scale(loss).backward()
-                losses += loss.item() * grad_accum_steps 
-                
+                scaler.step(optimizer)
+                scaler.update()
+
+                losses += loss.item()
                 _, preds = torch.max(logits_final, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
-
-                # Update trọng số sau khi đủ bước tích lũy
-                if (i + 1) % grad_accum_steps == 0 or (i + 1) == len(train_loader):
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
-                
-                del inputs, targets, logits_final, loss 
+                del inputs, targets, logits_final, loss # Xóa ngay lập tức
         
             scheduler.step()
             train_acc = 100. * correct / total
-            info = "Task {} Epoch {}/{} => Loss {:.3f}, Acc {:.2f}".format(
+            info = "Task {} --> Learning Noise: Epoch {}/{} => Loss {:.3f}, Acc {:.2f}".format(
                 self.cur_task, epoch + 1, epochs, losses / len(train_loader), train_acc)
             self.logger.info(info)
             prog_bar.set_description(info)
         
         del optimizer, scheduler
         self._clear_gpu()
-
     def fit_fc(self, train_loader, test_loader):
         self._network.eval()
         self._network.to(self.device)
