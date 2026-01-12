@@ -380,8 +380,8 @@ class MinNet(object):
             # Greedy Selection
             f_cont.eval()
             all_selected_feats = None
-            samples_needed = 40
-            sup_batch = 60
+            samples_needed = 20
+            sup_batch = 50
             
             with torch.no_grad():
                 for step in range(samples_needed):
